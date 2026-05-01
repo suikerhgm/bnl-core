@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+venv/
+.env
+nexus_state.db
+nexus_state.db-shm
+nexus_state.db-wal
+*.log
+.DS_Store
+Thumbs.db
+_py_files.txt
+c
+test_ui.html

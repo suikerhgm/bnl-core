@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import secrets; print\\(secrets.token_hex\\(32\\)\\)\")",
+      "PowerShell(python -c \"import secrets; print\\(secrets.token_hex\\(32\\)\\)\")",
+      "PowerShell(py -3 -c \"import secrets; print\\(secrets.token_hex\\(32\\)\\)\")"
+    ]
+  }
+}
