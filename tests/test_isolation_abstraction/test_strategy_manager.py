@@ -152,3 +152,23 @@ def test_returns_tried_tiers_list():
         snap(WINDOWS_TIERS), IsolationPolicy.BEST_AVAILABLE, None, min_security_score=65,
     )
     assert isinstance(tried, list)
+
+
+def test_preferred_capabilities_soft_reorder():
+    # Prefer tiers with forensics support — DOCKER_HARDENED has it, SANDBOX doesn't
+    tier, *_ = mgr.select_tier(
+        snap(WINDOWS_TIERS), IsolationPolicy.BEST_AVAILABLE, None,
+        preferred_capabilities={"supports_forensics"},
+    )
+    assert tier == IsolationTier.DOCKER_HARDENED  # moved to front due to preference
+
+
+def test_preferred_capabilities_fallback_when_none_match():
+    # Prefer nested isolation — nothing in WINDOWS_TIERS supports it
+    # Should still select best available without error
+    tier, *_ = mgr.select_tier(
+        snap(WINDOWS_TIERS), IsolationPolicy.BEST_AVAILABLE, None,
+        preferred_capabilities={"supports_nested_isolation"},
+    )
+    # Falls back to DOCKER_HARDENED (best in WINDOWS_TIERS)
+    assert tier == IsolationTier.DOCKER_HARDENED

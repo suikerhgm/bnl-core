@@ -74,6 +74,18 @@ class IsolationStrategyManager:
         """
         Select the best available isolation tier given all constraints.
 
+        Args:
+            snapshot: Current capability snapshot.
+            policy: Selection policy (BEST_AVAILABLE, SAFE_DEGRADATION, etc.).
+            requested_tier: Specific tier requested (used by NO_FALLBACK policy).
+            min_security_score: Minimum effective security score required.
+            required_capabilities: Hard requirement — candidates must have ALL.
+            preferred_runtime_types: Soft preference — candidates with these types
+                are moved to the front of the evaluation order.
+            forbidden_runtime_types: Candidates with these runtime types are excluded.
+            preferred_capabilities: Soft preference — candidates with ALL these capabilities
+                are moved to the front of the evaluation order. Does not exclude any candidate.
+
         Returns:
             (selected_tier, tried_tiers_list, rejection_reasons_dict)
 
@@ -103,6 +115,15 @@ class IsolationStrategyManager:
                 if _TIER_RUNTIME_TYPE.get(t) not in preferred_set
             ]
             candidates = preferred_tiers + other_tiers
+
+        # Step 3b: soft reorder by preferred capabilities (non-filtering)
+        if preferred_capabilities:
+            has_preferred = [
+                t for t in candidates
+                if all(getattr(TIER_CAPABILITIES[t], cap, False) for cap in preferred_capabilities)
+            ]
+            lacks_preferred = [t for t in candidates if t not in has_preferred]
+            candidates = has_preferred + lacks_preferred
 
         # Step 4: evaluate ALL candidates — collect rejections for all that fail,
         # then pick the first passing tier.
