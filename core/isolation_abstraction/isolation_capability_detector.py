@@ -19,6 +19,16 @@ from typing import Optional
 from core.isolation_abstraction.isolation_driver import IsolationTier
 
 
+# Cache source normalization
+_CACHE_SOURCE_MAP = {
+    "startup": "startup_probe",
+    "manual_refresh": "manual_refresh",
+    "docker_restart": "manual_refresh",
+    "healthcheck_failure": "background_healthcheck",
+    "background_healthcheck": "background_healthcheck",
+}
+
+
 # ---------------------------------------------------------------------------
 # CapabilitySnapshot (frozen dataclass)
 # ---------------------------------------------------------------------------
@@ -115,6 +125,8 @@ class IsolationCapabilityDetector:
 
     def _probe(self, reason: str) -> CapabilitySnapshot:
         """Probe the host environment and build a CapabilitySnapshot."""
+        health_score = 100.0  # Starts at 100, degrades on probe failures
+
         # host_os
         system = platform.system().lower()
         if system == "linux":
@@ -136,7 +148,9 @@ class IsolationCapabilityDetector:
         has_qemu = (shutil.which("qemu-system-x86_64") is not None) and has_kvm
 
         # has_docker: docker info returns 0
+        # With health degradation on timeout
         has_docker = False
+        docker_runtime: Optional[str] = None
         try:
             result = subprocess.run(
                 ["docker", "info"],
@@ -145,11 +159,12 @@ class IsolationCapabilityDetector:
                 timeout=5,
             )
             has_docker = result.returncode == 0
+            if has_docker:
+                docker_runtime = "docker"
+        except subprocess.TimeoutExpired:
+            health_score -= 15.0  # docker exists but is unresponsive
         except Exception:
-            has_docker = False
-
-        # docker_runtime
-        docker_runtime: Optional[str] = "docker" if has_docker else None
+            pass  # not installed — not a health degradation, just unavailable
 
         # has_wsl2
         has_wsl2 = False
@@ -184,8 +199,8 @@ class IsolationCapabilityDetector:
         if has_firecracker:
             tiers.add(IsolationTier.FIRECRACKER)
 
-        # cache metadata
-        cache_source = "startup_probe" if reason == "startup" else reason
+        # cache metadata — normalize cache_source
+        cache_source = _CACHE_SOURCE_MAP.get(reason, "manual_refresh")
 
         return CapabilitySnapshot(
             has_firecracker=has_firecracker,
@@ -200,7 +215,7 @@ class IsolationCapabilityDetector:
             last_refresh_reason=reason,
             available_tiers=frozenset(tiers),
             detected_at=datetime.now(timezone.utc),
-            cache_health_score=100.0,
+            cache_health_score=max(0.0, health_score),
             cache_source=cache_source,
             cache_generation=self._generation,
         )
