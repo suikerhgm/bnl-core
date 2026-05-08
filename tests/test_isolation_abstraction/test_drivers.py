@@ -3,6 +3,7 @@ Tests for core/isolation_abstraction/drivers/process_jail_driver.py
 Task 5: ProcessJailDriver (Tier 5)
 """
 import asyncio
+import uuid
 import pytest
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch, AsyncMock
@@ -240,3 +241,179 @@ async def test_sandbox_execute_handles_exception_gracefully():
         result = await d.execute(handle, ExecutionPayload(command="anything"))
     assert result.success is False
     assert "sandbox crashed" in result.error
+
+
+# ─── DockerHardenedDriver ─────────────────────────────────────────────────────
+
+def test_docker_driver_tier():
+    from core.isolation_abstraction.drivers.docker_hardened_driver import DockerHardenedDriver
+    assert DockerHardenedDriver().tier == IsolationTier.DOCKER_HARDENED
+
+
+def test_docker_driver_capabilities_match():
+    from core.isolation_abstraction.isolation_driver import TIER_CAPABILITIES
+    from core.isolation_abstraction.drivers.docker_hardened_driver import DockerHardenedDriver
+    assert DockerHardenedDriver().capabilities == TIER_CAPABILITIES[IsolationTier.DOCKER_HARDENED]
+
+
+def test_docker_driver_unavailable_when_no_docker():
+    from core.isolation_abstraction.drivers.docker_hardened_driver import DockerHardenedDriver
+    d = DockerHardenedDriver()
+    with patch("core.isolation_abstraction.drivers.docker_hardened_driver.subprocess.run",
+               return_value=MagicMock(returncode=1)):
+        d._available = None  # reset cache
+        assert d.is_available() is False
+
+
+def test_docker_driver_available_when_docker_running():
+    from core.isolation_abstraction.drivers.docker_hardened_driver import DockerHardenedDriver
+    d = DockerHardenedDriver()
+    with patch("core.isolation_abstraction.drivers.docker_hardened_driver.subprocess.run",
+               return_value=MagicMock(returncode=0)):
+        d._available = None
+        assert d.is_available() is True
+
+
+@pytest.mark.asyncio
+async def test_docker_create_runtime_uses_hardened_config():
+    from core.isolation_abstraction.drivers.docker_hardened_driver import DockerHardenedDriver
+    mock_container = MagicMock()
+    mock_container.id = "ctr-abc123"
+    mock_client = MagicMock()
+    mock_client.info.return_value = {"DefaultRuntime": "runc", "SecurityOptions": [], "CgroupDriver": "cgroupfs"}
+    mock_client.containers.run.return_value = mock_container
+
+    d = DockerHardenedDriver()
+    with patch.object(d, "_get_client", return_value=mock_client):
+        handle = await d.create_runtime(RuntimeConfig(agent_id="a1"))
+
+    assert handle.tier == IsolationTier.DOCKER_HARDENED
+    assert _get_handle_state(handle.runtime_id, "container_id") == "ctr-abc123"
+    # Verify hardened kwargs were passed
+    call_kwargs = mock_client.containers.run.call_args[1]
+    assert call_kwargs["network_mode"] == "none"
+    assert "ALL" in call_kwargs["cap_drop"]
+    assert "no-new-privileges:true" in call_kwargs["security_opt"]
+
+
+@pytest.mark.asyncio
+async def test_docker_create_runtime_raises_on_unhealthy_daemon():
+    from core.isolation_abstraction.drivers.docker_hardened_driver import DockerHardenedDriver
+    mock_client = MagicMock()
+    mock_client.info.side_effect = Exception("daemon not running")
+
+    d = DockerHardenedDriver()
+    with patch.object(d, "_get_client", return_value=mock_client):
+        with pytest.raises(RuntimeError, match="unhealthy"):
+            await d.create_runtime(RuntimeConfig(agent_id="a1"))
+
+
+@pytest.mark.asyncio
+async def test_docker_execute_returns_result():
+    from core.isolation_abstraction.drivers.docker_hardened_driver import DockerHardenedDriver
+    mock_container = MagicMock()
+    mock_container.exec_run.return_value = (0, b"hello world")
+    mock_client = MagicMock()
+    mock_client.containers.get.return_value = mock_container
+
+    d = DockerHardenedDriver()
+    with patch.object(d, "_get_client", return_value=mock_client):
+        handle = RuntimeHandle(
+            runtime_id=str(uuid.uuid4()), runtime_type="docker",
+            tier=IsolationTier.DOCKER_HARDENED, created_at=datetime.now(timezone.utc),
+        )
+        _set_handle_state(handle.runtime_id, "container_id", "ctr-abc")
+        result = await d.execute(handle, ExecutionPayload(command="echo hello world"))
+
+    assert result.success is True
+    assert "hello world" in result.output
+    assert result.tier_used == IsolationTier.DOCKER_HARDENED
+
+
+@pytest.mark.asyncio
+async def test_docker_execute_propagates_ctx():
+    from core.isolation_abstraction.drivers.docker_hardened_driver import DockerHardenedDriver
+    mock_container = MagicMock()
+    mock_container.exec_run.return_value = (0, b"ok")
+    mock_client = MagicMock()
+    mock_client.containers.get.return_value = mock_container
+
+    d = DockerHardenedDriver()
+    ctx = ExecutionContext(correlation_id="docker-corr-789")
+    with patch.object(d, "_get_client", return_value=mock_client):
+        handle = RuntimeHandle(
+            runtime_id=str(uuid.uuid4()), runtime_type="docker",
+            tier=IsolationTier.DOCKER_HARDENED, created_at=datetime.now(timezone.utc),
+        )
+        _set_handle_state(handle.runtime_id, "container_id", "ctr-xyz")
+        result = await d.execute(handle, ExecutionPayload(command="echo"), ctx=ctx)
+
+    assert result.correlation_id == "docker-corr-789"
+    assert result.execution_id == ctx.execution_id
+
+
+@pytest.mark.asyncio
+async def test_docker_snapshot_returns_snapshot_ref():
+    from core.isolation_abstraction.drivers.docker_hardened_driver import DockerHardenedDriver
+    mock_image = MagicMock()
+    mock_image.id = "sha256:abc123"
+    mock_container = MagicMock()
+    mock_container.commit.return_value = mock_image
+    mock_client = MagicMock()
+    mock_client.containers.get.return_value = mock_container
+
+    d = DockerHardenedDriver()
+    with patch.object(d, "_get_client", return_value=mock_client):
+        handle = RuntimeHandle(
+            runtime_id=str(uuid.uuid4()), runtime_type="docker",
+            tier=IsolationTier.DOCKER_HARDENED, created_at=datetime.now(timezone.utc),
+        )
+        _set_handle_state(handle.runtime_id, "container_id", "ctr-abc")
+        ref = await d.snapshot(handle)
+
+    assert ref.available is True
+    assert ref.snapshot_id == "sha256:abc123"
+
+
+@pytest.mark.asyncio
+async def test_docker_quarantine_pauses_container():
+    from core.isolation_abstraction.drivers.docker_hardened_driver import DockerHardenedDriver
+    mock_container = MagicMock()
+    mock_client = MagicMock()
+    mock_client.containers.get.return_value = mock_container
+
+    d = DockerHardenedDriver()
+    with patch.object(d, "_get_client", return_value=mock_client):
+        with patch("core.isolation_abstraction.drivers.docker_hardened_driver.get_permission_manager",
+                   side_effect=ImportError):
+            handle = RuntimeHandle(
+                runtime_id=str(uuid.uuid4()), runtime_type="docker",
+                tier=IsolationTier.DOCKER_HARDENED, created_at=datetime.now(timezone.utc),
+            )
+            _set_handle_state(handle.runtime_id, "container_id", "ctr-abc")
+            await d.quarantine(handle, "suspicious activity")
+
+    mock_container.pause.assert_called_once()
+    assert _get_handle_state(handle.runtime_id, "state") == RuntimeLifecycleState.QUARANTINED
+
+
+@pytest.mark.asyncio
+async def test_docker_destroy_removes_container():
+    from core.isolation_abstraction.drivers.docker_hardened_driver import DockerHardenedDriver
+    mock_container = MagicMock()
+    mock_client = MagicMock()
+    mock_client.containers.get.return_value = mock_container
+
+    d = DockerHardenedDriver()
+    with patch.object(d, "_get_client", return_value=mock_client):
+        handle = RuntimeHandle(
+            runtime_id=str(uuid.uuid4()), runtime_type="docker",
+            tier=IsolationTier.DOCKER_HARDENED, created_at=datetime.now(timezone.utc),
+        )
+        ctr_id = "ctr-to-remove"
+        _set_handle_state(handle.runtime_id, "container_id", ctr_id)
+        rid = handle.runtime_id
+        await d.destroy(handle)
+
+    mock_container.remove.assert_called_once_with(force=True)
+    assert _get_handle_state(rid, "container_id") is None
