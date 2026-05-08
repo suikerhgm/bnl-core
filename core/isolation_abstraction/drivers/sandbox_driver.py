@@ -71,7 +71,8 @@ class SandboxDriver(IsolationDriver):
             created_at=datetime.now(timezone.utc),
             state=RuntimeLifecycleState.CREATED,
         )
-        _set_handle_state(handle.runtime_id, "sandbox_id", result["sandbox_id"])
+        sandbox_id = result.sandbox_id if hasattr(result, "sandbox_id") else result.get("sandbox_id", str(uuid.uuid4()))
+        _set_handle_state(handle.runtime_id, "sandbox_id", sandbox_id)
         _set_handle_state(handle.runtime_id, "agent_id", config.agent_id)
         _set_handle_state(handle.runtime_id, "state", RuntimeLifecycleState.RUNNING)
         return handle
