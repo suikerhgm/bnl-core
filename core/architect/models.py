@@ -1,5 +1,6 @@
 # core/architect/models.py
 from __future__ import annotations
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -159,3 +160,57 @@ TASK_TYPE_TO_PERMISSION: dict[str, str] = {
     "file_write":      "FS_WRITE",
     "threat_model":    "SB_SCAN",
 }
+
+
+# ── Architect-level execution context ──────────────────────────────────────────
+# Distinct from core.isolation_abstraction.isolation_driver.ExecutionContext
+# This is the high-level orchestration context, not the runtime isolation context.
+
+@dataclass
+class ArchitectExecutionContext:
+    """High-level orchestration context. Propagates through the full pipeline."""
+    execution_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    correlation_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    trace_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str = "anonymous"
+    requested_capabilities: list[str] = field(default_factory=list)
+    isolation_policy: Optional[IsolationPolicy] = None   # None = let planner decide
+    trust_level: int = 50                                 # requestor trust (0–100)
+    risk_score: int = 0                                   # computed during planning
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    parent_execution_id: Optional[str] = None            # for nested orchestrations
+    audit_refs: list[str] = field(default_factory=list)  # event_ids from audit logger
+
+
+@dataclass
+class ArchitectExecutionResult:
+    """Final consolidated result returned to the caller."""
+    # Identity
+    execution_id: str
+    plan_id: str
+    correlation_id: str
+    trace_id: str
+
+    # Outcome
+    success: bool
+    outputs: list[str]                    # collected outputs from all completed tasks
+    error_summary: Optional[str]          # None if success
+
+    # Agents & runtimes used
+    agents_used: list[str]                # agent_ids that ran tasks
+    runtimes_used: list[str]              # tier names (DOCKER_HARDENED, PROCESS_JAIL, etc.)
+    fallback_chain: list[dict]            # [{task_id, requested_tier, actual_tier, level}]
+
+    # Security & audit
+    security_events: list[dict]           # from isolation layer
+    audit_refs: list[str]                 # execution_ids + correlation_ids
+    avg_security_score: int
+
+    # Timing
+    execution_time_ms: int
+    task_count: int
+    failed_task_count: int
+    skipped_task_count: int
+
+    # Repair hooks (Plan D)
+    repair_attempts: list[dict] = field(default_factory=list)   # always [] for now
