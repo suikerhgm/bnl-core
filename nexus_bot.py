@@ -353,6 +353,29 @@ Luego abre index.html en el navegador.
     })
 
 
+@app.post("/architect/execute")
+async def architect_execute(request: Request):
+    """
+    The Architect — operational director of Nexus.
+    Receives any user goal and executes the full pipeline:
+    planner → specialized agents → execution → validation → repair → result.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    goal = data.get("goal", data.get("request", "")).strip()
+    user_id = data.get("user_id", "api")
+
+    if not goal:
+        return JSONResponse({"success": False, "error": "goal is required"}, status_code=400)
+
+    from core.architect.architect_core import execute_goal
+    result = await execute_goal(goal, user_id=user_id)
+    return JSONResponse(result)
+
+
 @app.get("/diagnose")
 async def diagnose():
     """Endpoint de diagnóstico completo"""

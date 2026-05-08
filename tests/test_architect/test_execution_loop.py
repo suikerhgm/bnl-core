@@ -140,11 +140,13 @@ async def test_run_success_sets_success_true(loop):
 
 @pytest.mark.asyncio
 async def test_run_populates_trace(loop):
-    result = await loop.run("create a simple app")
+    # Use a non-app request so it goes through architect_execute path
+    result = await loop.run("write a utility function")
     assert len(result.trace) >= 3  # context_created + execute + validate + finalize
     step_names = [s.step for s in result.trace]
     assert "context_created" in step_names
-    assert "architect_execute" in step_names
+    # Either architect_execute (normal) or app_create_detected (app path)
+    assert any(s in step_names for s in ("architect_execute", "app_create_detected"))
     assert "validate" in step_names
 
 

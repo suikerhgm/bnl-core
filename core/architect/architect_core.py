@@ -321,3 +321,32 @@ def get_architect_core() -> ArchitectCore:
             if _core_instance is None:
                 _core_instance = ArchitectCore()
     return _core_instance
+
+
+# ── Public entry point: execute_goal() ────────────────────────────────────────
+
+async def execute_goal(user_goal: str, user_id: str = "user") -> dict:
+    """
+    Main public API for Nexus.
+    Routes to AppCreator for app_create tasks; uses full pipeline for others.
+    Returns a structured dict suitable for Telegram or API response.
+    """
+    from core.architect.execution_loop import get_execution_loop
+    loop = get_execution_loop()
+    response = await loop.run(user_goal, user_id=user_id)
+    return {
+        "success": response.success,
+        "message": response.message,
+        "execution_id": response.execution_id,
+        "outputs": response.outputs,
+        "agents_used": response.agents_used,
+        "runtimes_used": response.runtimes_used,
+        "execution_time_ms": response.execution_time_ms,
+        "repair_attempted": response.repair_attempted,
+        "repair_succeeded": response.repair_succeeded,
+        "error_summary": response.error_summary,
+        "trace": [
+            {"step": s.step, "status": s.status, "detail": s.detail}
+            for s in response.trace
+        ],
+    }
