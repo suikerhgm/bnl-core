@@ -10,7 +10,7 @@ import threading
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum, IntEnum
 from typing import Any
 
@@ -204,7 +204,7 @@ class RuntimeHealthStats:
     stability_score: float = 100.0
     anomaly_score: float = 0.0
     failure_rate: float = 0.0
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 # ---------------------------------------------------------------------------
