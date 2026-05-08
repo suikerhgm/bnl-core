@@ -215,3 +215,47 @@ def vm_policies():
         ]
     except Exception:
         return []
+
+
+@router.post("/architect/run")
+async def architect_run(request: dict):
+    """
+    The Architect — operational director of Nexus.
+    Receives any user request and executes the full pipeline:
+    plan → dispatch → isolated execution → validate → [repair] → result
+    """
+    from core.architect.execution_loop import get_execution_loop
+
+    user_request = request.get("request", "")
+    user_id = request.get("user_id", "api-user")
+    trust_level = int(request.get("trust_level", 50))
+
+    if not user_request.strip():
+        raise HTTPException(status_code=400, detail="request is required")
+
+    try:
+        loop = get_execution_loop()
+        response = await loop.run(user_request, user_id=user_id, trust_level=trust_level)
+        return {
+            "success": response.success,
+            "message": response.message,
+            "execution_id": response.execution_id,
+            "plan_id": response.plan_id,
+            "task_count": response.task_count,
+            "agents_used": response.agents_used,
+            "runtimes_used": response.runtimes_used,
+            "avg_security_score": response.avg_security_score,
+            "execution_time_ms": response.execution_time_ms,
+            "repair_attempted": response.repair_attempted,
+            "repair_succeeded": response.repair_succeeded,
+            "outputs": response.outputs,
+            "error_summary": response.error_summary,
+            "fallback_chain": response.fallback_chain,
+            "audit_refs": response.audit_refs,
+            "trace": [
+                {"step": s.step, "status": s.status, "detail": s.detail, "duration_ms": s.duration_ms}
+                for s in response.trace
+            ],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
