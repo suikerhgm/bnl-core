@@ -115,3 +115,128 @@ async def test_process_jail_quarantine_sets_state():
     ):
         await d.quarantine(handle, "test reason")
     assert _get_handle_state(handle.runtime_id, "state") == RuntimeLifecycleState.QUARANTINED
+
+
+# ─── SandboxDriver ────────────────────────────────────────────────────────────
+
+def test_sandbox_driver_tier():
+    from core.isolation_abstraction.drivers.sandbox_driver import SandboxDriver
+    assert SandboxDriver().tier == IsolationTier.SANDBOX
+
+
+def test_sandbox_driver_always_available():
+    from core.isolation_abstraction.drivers.sandbox_driver import SandboxDriver
+    assert SandboxDriver().is_available() is True
+
+
+def test_sandbox_capabilities_match_tier():
+    from core.isolation_abstraction.isolation_driver import TIER_CAPABILITIES
+    from core.isolation_abstraction.drivers.sandbox_driver import SandboxDriver
+    assert SandboxDriver().capabilities == TIER_CAPABILITIES[IsolationTier.SANDBOX]
+
+
+@pytest.mark.asyncio
+async def test_sandbox_create_runtime_returns_handle():
+    from core.isolation_abstraction.drivers.sandbox_driver import SandboxDriver
+    mock_mgr = MagicMock()
+    mock_mgr.create_sandbox.return_value = {"sandbox_id": "sb-001", "status": "CREATED"}
+    with patch("core.isolation_abstraction.drivers.sandbox_driver.get_sandbox_manager",
+               return_value=mock_mgr):
+        d = SandboxDriver()
+        handle = await d.create_runtime(RuntimeConfig(agent_id="a1"))
+    assert handle.tier == IsolationTier.SANDBOX
+    assert _get_handle_state(handle.runtime_id, "sandbox_id") == "sb-001"
+    assert _get_handle_state(handle.runtime_id, "agent_id") == "a1"
+
+
+@pytest.mark.asyncio
+async def test_sandbox_execute_returns_result():
+    from core.isolation_abstraction.drivers.sandbox_driver import SandboxDriver
+    mock_mgr = MagicMock()
+    mock_mgr.create_sandbox.return_value = {"sandbox_id": "sb-002", "status": "CREATED"}
+    mock_mgr.execute_in_sandbox.return_value = {
+        "success": True, "output": "hello", "error": None, "exit_code": 0
+    }
+    with patch("core.isolation_abstraction.drivers.sandbox_driver.get_sandbox_manager",
+               return_value=mock_mgr):
+        d = SandboxDriver()
+        handle = await d.create_runtime(RuntimeConfig(agent_id="a1"))
+        result = await d.execute(handle, ExecutionPayload(command="echo hello"))
+    assert result.success is True
+    assert result.output == "hello"
+    assert result.tier_used == IsolationTier.SANDBOX
+
+
+@pytest.mark.asyncio
+async def test_sandbox_execute_propagates_ctx():
+    from core.isolation_abstraction.drivers.sandbox_driver import SandboxDriver
+    mock_mgr = MagicMock()
+    mock_mgr.create_sandbox.return_value = {"sandbox_id": "sb-003", "status": "CREATED"}
+    mock_mgr.execute_in_sandbox.return_value = {"success": True, "output": "", "error": None, "exit_code": 0}
+    with patch("core.isolation_abstraction.drivers.sandbox_driver.get_sandbox_manager",
+               return_value=mock_mgr):
+        d = SandboxDriver()
+        handle = await d.create_runtime(RuntimeConfig(agent_id="a1"))
+        ctx = ExecutionContext(correlation_id="corr-456")
+        result = await d.execute(handle, ExecutionPayload(command="echo"), ctx=ctx)
+    assert result.correlation_id == "corr-456"
+    assert result.execution_id == ctx.execution_id
+
+
+@pytest.mark.asyncio
+async def test_sandbox_snapshot_unavailable():
+    from core.isolation_abstraction.drivers.sandbox_driver import SandboxDriver
+    mock_mgr = MagicMock()
+    mock_mgr.create_sandbox.return_value = {"sandbox_id": "sb-004", "status": "CREATED"}
+    with patch("core.isolation_abstraction.drivers.sandbox_driver.get_sandbox_manager",
+               return_value=mock_mgr):
+        d = SandboxDriver()
+        handle = await d.create_runtime(RuntimeConfig(agent_id="a1"))
+        ref = await d.snapshot(handle)
+    assert ref.available is False
+
+
+@pytest.mark.asyncio
+async def test_sandbox_quarantine_calls_manager_and_sets_state():
+    from core.isolation_abstraction.drivers.sandbox_driver import SandboxDriver
+    mock_mgr = MagicMock()
+    mock_mgr.create_sandbox.return_value = {"sandbox_id": "sb-005", "status": "CREATED"}
+    mock_mgr.quarantine_sandbox.return_value = True
+    with patch("core.isolation_abstraction.drivers.sandbox_driver.get_sandbox_manager",
+               return_value=mock_mgr):
+        with patch("core.isolation_abstraction.drivers.sandbox_driver.get_permission_manager",
+                   side_effect=ImportError):
+            d = SandboxDriver()
+            handle = await d.create_runtime(RuntimeConfig(agent_id="a1"))
+            await d.quarantine(handle, "test reason")
+    mock_mgr.quarantine_sandbox.assert_called_once_with("sb-005", "test reason")
+    assert _get_handle_state(handle.runtime_id, "state") == RuntimeLifecycleState.QUARANTINED
+
+
+@pytest.mark.asyncio
+async def test_sandbox_destroy_clears_state():
+    from core.isolation_abstraction.drivers.sandbox_driver import SandboxDriver
+    mock_mgr = MagicMock()
+    mock_mgr.create_sandbox.return_value = {"sandbox_id": "sb-006", "status": "CREATED"}
+    with patch("core.isolation_abstraction.drivers.sandbox_driver.get_sandbox_manager",
+               return_value=mock_mgr):
+        d = SandboxDriver()
+        handle = await d.create_runtime(RuntimeConfig(agent_id="a1"))
+        rid = handle.runtime_id
+        await d.destroy(handle)
+    assert _get_handle_state(rid, "sandbox_id") is None
+
+
+@pytest.mark.asyncio
+async def test_sandbox_execute_handles_exception_gracefully():
+    from core.isolation_abstraction.drivers.sandbox_driver import SandboxDriver
+    mock_mgr = MagicMock()
+    mock_mgr.create_sandbox.return_value = {"sandbox_id": "sb-007", "status": "CREATED"}
+    mock_mgr.execute_in_sandbox.side_effect = RuntimeError("sandbox crashed")
+    with patch("core.isolation_abstraction.drivers.sandbox_driver.get_sandbox_manager",
+               return_value=mock_mgr):
+        d = SandboxDriver()
+        handle = await d.create_runtime(RuntimeConfig(agent_id="a1"))
+        result = await d.execute(handle, ExecutionPayload(command="anything"))
+    assert result.success is False
+    assert "sandbox crashed" in result.error
