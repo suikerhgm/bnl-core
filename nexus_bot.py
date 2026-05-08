@@ -10,13 +10,20 @@ Stack:
 Autor: Claude + Leo
 Versión: 3.0 (servicio separado, lógica en telegram_service.py)
 """
+import asyncio
 import os
+import sys
 import json
 import logging
 from datetime import datetime
 
+# Ensure asyncio subprocesses work on Windows regardless of how uvicorn
+# configures its event loop (especially under --reload worker processes).
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from dotenv import load_dotenv
@@ -27,6 +34,12 @@ from app.services.telegram_service import (
     API_CASCADE,
     current_api_index,
 )
+
+# ── Runtime Engine ──────────────────────────────────────────────
+from core.runtime.runtime_engine import get_engine
+
+# ── Auto-Loop Engine ─────────────────────────────────────────────
+from core.auto_loop_engine import get_loop_engine
 
 load_dotenv()
 
@@ -52,6 +65,13 @@ app.add_middleware(
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 
+# ── Boot RuntimeEngine when the server starts ──────────────────
+@app.on_event("startup")
+async def _start_runtime_engine():
+    get_engine().start()
+    logger.info("🔄 RuntimeEngine started — watching generated_apps/")
+
+
 # ===== TELEGRAM WEBHOOK =====
 
 @app.post("/webhook")
@@ -73,6 +93,12 @@ async def telegram_webhook(request: Request):
 
 
 # ===== ENDPOINTS DE UTILIDAD =====
+
+@app.get("/ping")
+def ping():
+    """Healthcheck para run.py y monitoreo externo."""
+    return {"status": "ok"}
+
 
 @app.get("/")
 async def root():
@@ -221,6 +247,112 @@ async def api_status():
     }
 
 
+@app.post("/build-app")
+async def build_app(request: Request):
+    """Genera un proyecto mínimo: backend FastAPI + index.html + README."""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    idea = data.get("idea", "proyecto")
+    import time
+    from pathlib import Path
+
+    project_id = f"app_{int(time.time())}"
+    project_path = Path("generated_apps") / project_id
+    project_path.mkdir(parents=True, exist_ok=True)
+
+    # ── backend.py ───────────────────────────────────────────────
+    backend_code = '''\
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.get("/")
+def index():
+    return FileResponse("index.html")
+
+@app.get("/ping")
+def ping():
+    return {"message": "pong"}
+'''
+
+    # ── index.html — fetch uses relative path, served via GET / ──
+    html_code = f'''\
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>{idea}</title>
+</head>
+<body>
+  <h1>{idea}</h1>
+  <button onclick="pingBackend()">Ping backend</button>
+  <p id="result"></p>
+  <script>
+    async function pingBackend() {{
+      try {{
+        const res = await fetch("/ping");
+        const data = await res.json();
+        document.getElementById("result").textContent = data.message;
+      }} catch (e) {{
+        document.getElementById("result").textContent = "Error: " + e;
+      }}
+    }}
+  </script>
+</body>
+</html>
+'''
+
+    # ── README.txt ───────────────────────────────────────────────
+    readme = f'''\
+Proyecto: {idea}
+Generado por Nexus BNL
+
+Para correr:
+    uvicorn backend:app --port 8002
+
+Luego abre index.html en el navegador.
+'''
+
+    (project_path / "backend.py").write_text(backend_code, encoding="utf-8")
+    (project_path / "index.html").write_text(html_code, encoding="utf-8")
+    (project_path / "README.txt").write_text(readme, encoding="utf-8")
+
+    files = ["backend.py", "index.html", "README.txt"]
+
+    # ── Auto-launch backend via RuntimeEngine ─────────────────────
+    launched = await get_engine().launch(project_id, project_path)
+    logger.info(
+        "🚀 /build-app: project '%s' created — launched=%s", project_id, launched
+    )
+
+    # ── Auto-loop: detect port and start correction cycle in background ──
+    if launched:
+        async def _run_autoloop():
+            # AutoLoopEngine discovers the real port from RuntimeEngine internally —
+            # no need to pre-read it here (avoids race where port isn't set yet).
+            logger.info("🔁 /build-app: starting autoloop for '%s'", project_id)
+            healthy = await get_loop_engine().run(project_id, project_path)
+            logger.info("🔁 /build-app: autoloop finished for '%s' — healthy=%s",
+                        project_id, healthy)
+
+        asyncio.create_task(_run_autoloop())
+
+    return JSONResponse({
+        "success":      True,
+        "message":      f"Proyecto '{idea}' creado en {project_path}",
+        "project_path": str(project_path),
+        "project_id":   project_id,
+        "files":        files,
+        "running":      launched,
+    })
+
+
 @app.get("/diagnose")
 async def diagnose():
     """Endpoint de diagnóstico completo"""
@@ -326,6 +458,41 @@ async def diagnose():
     ) else "⚠️ Hay problemas que revisar"
 
     return diagnostics
+
+
+# ── ERROR_TAXONOMY_SYSTEM: /repair/status endpoint ──────────────────────────
+
+@app.get("/repair/status")
+async def repair_status():
+    """Return repair metrics and recent history from ERROR_TAXONOMY_SYSTEM."""
+    try:
+        from core.repair.repair_tracker import get_metrics, get_history
+        from core.repair_engine import get_repair_engine
+        metrics = get_metrics()
+        history = get_history(limit=30)
+        active  = list(get_repair_engine()._active)
+        return {
+            "metrics": metrics,
+            "active_repairs": active,
+            "history": history,
+        }
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+@app.get("/repair/dashboard", response_class=HTMLResponse)
+async def repair_dashboard():
+    """Serve the repair dashboard HTML."""
+    from pathlib import Path as _P
+    dash = _P("app/repair_dashboard.html")
+    if dash.exists():
+        return HTMLResponse(content=dash.read_text(encoding="utf-8"))
+    return HTMLResponse(content="<h1>repair_dashboard.html not found</h1>", status_code=404)
+
+
+# ── VM Isolation Routes ──────────────────────────────────────────
+from app.routes.vm_routes import router as vm_router
+app.include_router(vm_router)
 
 
 if __name__ == "__main__":
