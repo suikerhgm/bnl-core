@@ -8,6 +8,8 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
+import httpx
+
 from core.state_manager import save_states
 from core.ai_cascade import (
     call_ai_with_fallback,
@@ -24,7 +26,7 @@ from core.formatters import (
     _format_execution_result,
     build_memory_context,
 )
-from core.tools import NOTION_TOOLS
+from core.tools import NOTION_TOOLS, FILESYSTEM_TOOLS
 from core.memory_manager import MemoryManager
 from core.memory_router import MemoryRouter
 from core.memory_response_layer import MemoryResponseLayer
@@ -59,6 +61,8 @@ from core.agents.agent_registry import registry as _agent_registry
 from core.actions.code_action import CodeAction
 from core.actions.backend_action import BackendAction
 from core.actions.command_action import CommandAction, get_run_command
+from core.validation_layer import ValidationLayer
+from core.runtime.port_allocator import find_free_port
 import core.agents  # triggers registry.register() calls
 import time
 
@@ -132,9 +136,20 @@ def _is_explicit_approval(msg: str) -> bool:
     return msg.strip().lower() in _EXPLICIT_APPROVAL_TOKENS
 
 
+def _wants_auto_approve(msg: str) -> bool:
+    """Return True if the message/spec contains auto_aprobar: true (Bug #3 fix)."""
+    low = msg.lower()
+    return "auto_aprobar: true" in low or "auto_aprobar:true" in low
+
+
 # ── Caché de memoria en RAM (corto plazo) ──────────────────────────
 _recent_memory: dict = {}
 MAX_MEMORIES = 10
+
+# ── Active app context (Bug #5 fix) ────────────────────────────────
+# Updated whenever a project is auto-run so subsequent requests can
+# interact with it without regenerating code.
+_active_app: dict = {}  # keys: project_id, port, path
 
 
 def _detect_feedback(user_message: str) -> Optional[bool]:
@@ -280,6 +295,7 @@ async def _execute_action(
     user_message: str,
     chat_id: int,
     extra_params: Optional[Dict[str, Any]] = None,
+    _is_retry: bool = False,
 ) -> Optional[str]:
     """
     Ejecuta el Action System completo para un intent dado.
@@ -394,15 +410,33 @@ async def _execute_action(
                     inner["project_path"],
                     result["_files_written"],
                 )
-                # Auto-run: detect and execute safe start command
-                _run_cmd = get_run_command(inner["project_path"], result["result"]["files"])
+                # Git checkpoint immediately after write (best-effort)
+                try:
+                    from core.git_manager import checkpoint as _git_checkpoint
+                    _git_checkpoint(
+                        Path(inner["project_path"]),
+                        "[AI] generated app",
+                    )
+                except Exception as _ge:
+                    logger.warning("⚠️ Git checkpoint failed: %s", _ge)
+
+                # Auto-run: allocate a free port and detect the start command
+                _auto_port = find_free_port()
+                _run_cmd = get_run_command(inner["project_path"], result["result"]["files"], port=_auto_port)
                 if _run_cmd:
+                    # Mark as known before awaiting so RE's scan skips a duplicate launch
+                    _auto_pid = Path(inner["project_path"]).name
+                    try:
+                        from core.runtime.runtime_engine import get_engine as _get_engine_pre
+                        _get_engine_pre()._known.add(_auto_pid)
+                    except Exception:
+                        pass
                     _cmd_action = CommandAction({
                         "operation": "run",
                         "params": {
                             "command": _run_cmd,
                             "cwd": inner["project_path"],
-                            "project_id": Path(inner["project_path"]).name,
+                            "project_id": _auto_pid,
                         },
                     })
                     try:
@@ -414,12 +448,98 @@ async def _execute_action(
                             _run_result.get("result", {}).get("returncode"),
                             _run_result.get("result", {}).get("timed_out"),
                         )
+                        # Bug #5 fix: track active app so follow-up requests
+                        # can interact with it instead of generating new code.
+                        if _run_result.get("success"):
+                            _active_app.update({
+                                "project_id": Path(inner["project_path"]).name,
+                                "port": _auto_port,
+                                "path": inner["project_path"],
+                            })
+                            logger.info(
+                                "📍 Active app set: %s on port %s",
+                                _active_app["project_id"], _auto_port,
+                            )
+                        # Bug #6 fix: minimal startup test — wait then GET /ping
+                        if _run_result.get("success"):
+                            await asyncio.sleep(2.0)
+                            try:
+                                async with httpx.AsyncClient(timeout=4.0) as _hc:
+                                    _ping = await _hc.get(
+                                        f"http://127.0.0.1:{_auto_port}/ping"
+                                    )
+                                    result["_auto_test"] = {
+                                        "status": _ping.status_code,
+                                        "response": _ping.text[:300],
+                                    }
+                                    logger.info(
+                                        "🧪 Auto-test /ping → %s %s",
+                                        _ping.status_code, _ping.text[:80],
+                                    )
+                            except Exception as _te:
+                                result["_auto_test"] = {"error": str(_te)}
+                                logger.warning("⚠️ Auto-test failed: %s", _te)
+                        # Schedule repair loop — catches crashes that happen after
+                        # the 500ms startup window (e.g. missing imports surfaced
+                        # when the first request arrives or psutil not installed).
+                        try:
+                            from core.runtime.runtime_engine import get_engine as _get_engine
+                            asyncio.create_task(
+                                _get_engine()._repair_loop(
+                                    _auto_pid,
+                                    Path(inner["project_path"]),
+                                )
+                            )
+                            logger.info("🔧 Repair loop scheduled for '%s'", _auto_pid)
+                        except Exception as _re_exc:
+                            logger.warning("⚠️ Could not schedule repair loop: %s", _re_exc)
                     except Exception as _exc:
                         logger.warning("⚠️ Auto-run failed: %s", _exc)
             else:
                 logger.warning("⚠️ FileAction.write_project failed: %s", inner.get("error"))
         except Exception as exc:
             logger.warning("⚠️ Could not persist project to disk: %s", exc)
+
+    # 3c. ValidationLayer — verify build completeness (single retry if incomplete)
+    _validation_prefix: Optional[str] = None
+    if (
+        not _is_retry
+        and action.action_type == "CodeAction"
+        and result.get("success")
+        and isinstance(result.get("result"), dict)
+        and result["result"].get("mode") != "blueprint"
+        and "files" in result["result"]
+    ):
+        _vl = ValidationLayer()
+        _validation = _vl.validate(user_message, result["result"])
+        if not _validation["is_valid"]:
+            missing_lines = "\n".join(f"• {m}" for m in _validation["missing"])
+            logger.warning("⚠️ [ENGINE] VALIDATION FAILED — missing: %s", _validation["missing"])
+            logger.warning("⚠️ [ENGINE] Corrigiendo automáticamente...")
+
+            fix_request = (
+                f"{params.get('request', user_message)}\n\n"
+                f"{_validation['suggested_fix']}"
+            )
+            fix_extra = {**(extra_params or {}), "mode": "build"}
+            fix_str = await _execute_action(
+                intent=intent,
+                decision_trace=decision_trace,
+                user_message=fix_request,
+                chat_id=chat_id,
+                extra_params=fix_extra,
+                _is_retry=True,
+            )
+            if fix_str:
+                return (
+                    f"⚠️ Faltan cosas:\n{missing_lines}\n\n"
+                    f"Corrigiendo automáticamente...\n\n"
+                    + fix_str
+                )
+            # Fix returned nothing — fall through with warning prefix
+            _validation_prefix = f"⚠️ Faltan cosas:\n{missing_lines}\n\n"
+        else:
+            logger.warning("✅ [ENGINE] VALIDATION PASSED — proyecto completo")
 
     # 4. Log
     ActionLogger.log(
@@ -434,7 +554,10 @@ async def _execute_action(
     # 5. Format response for user
     if result.get("success"):
         logger.info(f"✅ Action executed successfully in {duration_ms}ms")
-        return _format_action_result(action, result)
+        formatted = _format_action_result(action, result)
+        if _validation_prefix:
+            return _validation_prefix + formatted
+        return formatted
     else:
         logger.error(f"❌ Action failed: {result.get('error')}")
         return _format_action_error(action, result)
@@ -455,7 +578,35 @@ def _extract_action_params(intent: str, user_message: str) -> Dict[str, Any]:
     """
     params: Dict[str, Any] = {}
 
-    if intent == "notion_create":
+    if intent == "file_write":
+        import re
+        msg = user_message
+        # Extract filename: "llamado test.txt", "named test.txt", or bare filename.ext
+        name_match = re.search(
+            r'(?:llamad[oa]|named?)\s+["\'“”]?([^\s"\'""]+)["\'“”]?',
+            msg, re.IGNORECASE
+        )
+        if name_match:
+            params["name"] = name_match.group(1).strip().rstrip(",")
+        else:
+            ext_match = re.search(r'\b(\w[\w\-]*\.\w+)\b', msg)
+            if ext_match:
+                params["name"] = ext_match.group(1)
+
+        # Extract content: 'hola mundo' or "hola mundo" after contenido/que diga
+        content_match = re.search(
+            r'(?:contenido|que diga)[:\s]+["\'“”]([^"\'""]+)["\'“”]',
+            msg, re.IGNORECASE
+        )
+        if content_match:
+            params["content"] = content_match.group(1).strip()
+        else:
+            # Fallback: grab any quoted string
+            fallback = re.search(r'["\'“”]([^"\'""]+)["\'“”]', msg)
+            if fallback and "name" in params and fallback.group(1) != params.get("name"):
+                params["content"] = fallback.group(1).strip()
+
+    elif intent == "notion_create":
         # Intentar extraer título después de "llamada" o "titulada"
         msg = user_message
         import re
@@ -663,6 +814,13 @@ def _format_action_result(action: Any, result: Dict[str, Any]) -> str:
         lang = _detect_code_language(code)
         return f"{header}\n\n```{lang}\n{code}\n```"
 
+    # ── FileAction ────────────────────────────────────────────────────
+    if action.action_type == "FileAction":
+        inner = action_result if isinstance(action_result, dict) else {}
+        name = inner.get("name", "?")
+        path = inner.get("path", "?")
+        return f"✅ Archivo creado: `{name}`\n📁 Ruta: `{path}`"
+
     # ── NotionAction ──────────────────────────────────────────────────
     if action.action_type == "NotionAction":
         page_title = action_result.get("title", "Sin título") if isinstance(action_result, dict) else "Sin título"
@@ -804,6 +962,40 @@ async def _execute_multi_agent_build(
     if not all_files:
         return "⚠️ Ningún agente generó archivos. Intenta de nuevo."
 
+    # ValidationLayer — check completeness before persisting
+    _multi_validation_prefix: Optional[str] = None
+    _vl = ValidationLayer()
+    _validation = _vl.validate(original_request, {"files": all_files})
+    if not _validation["is_valid"]:
+        missing_lines = "\n".join(f"• {m}" for m in _validation["missing"])
+        logger.warning("⚠️ [ENGINE] VALIDATION FAILED (multi-agent) — missing: %s", _validation["missing"])
+        logger.warning("⚠️ [ENGINE] Corrigiendo automáticamente...")
+        fix_request = (
+            f"{original_request}\n\n{_validation['suggested_fix']}"
+        )
+        fix_str = await _execute_action(
+            intent="code_generate",
+            decision_trace={
+                "intent": "code_generate",
+                "changed": False,
+                "source": "validation_fix",
+                "confidence": 1.0,
+            },
+            user_message=fix_request,
+            chat_id=chat_id,
+            extra_params={"mode": "build"},
+            _is_retry=True,
+        )
+        if fix_str:
+            return (
+                f"⚠️ Faltan cosas:\n{missing_lines}\n\n"
+                f"Corrigiendo automáticamente...\n\n"
+                + fix_str
+            )
+        _multi_validation_prefix = f"⚠️ Faltan cosas:\n{missing_lines}\n\n"
+    else:
+        logger.warning("✅ [ENGINE] VALIDATION PASSED (multi-agent) — proyecto completo")
+
     # Persist to disk via FileAction
     project_path: Optional[str] = None
     files_written = 0
@@ -823,15 +1015,33 @@ async def _execute_multi_agent_build(
                 "💾 Multi-agent project saved → %s (%d file(s))",
                 project_path, files_written,
             )
-            # Auto-run: detect and execute safe start command
-            run_cmd_used = get_run_command(project_path, all_files)
+            # Git checkpoint after multi-agent write (best-effort)
+            try:
+                from core.git_manager import checkpoint as _git_checkpoint
+                _git_checkpoint(Path(project_path), "[AI] generated app")
+            except Exception as _ge:
+                logger.warning("⚠️ Git checkpoint (multi-agent) failed: %s", _ge)
+
+            # Auto-run: allocate a free port and detect the start command
+            _multi_port = find_free_port()
+            run_cmd_used = get_run_command(project_path, all_files, port=_multi_port)
             if run_cmd_used:
+                # Mark as known BEFORE awaiting CommandAction so RuntimeEngine's
+                # scan (which runs during the asyncio yield inside create_subprocess_exec)
+                # sees this project in _known and skips a duplicate launch.
+                _pid = Path(project_path).name
+                try:
+                    from core.runtime.runtime_engine import get_engine as _get_re
+                    _get_re()._known.add(_pid)
+                except Exception:
+                    pass
+
                 _cmd_action = CommandAction({
                     "operation": "run",
                     "params": {
                         "command": run_cmd_used,
                         "cwd": project_path,
-                        "project_id": Path(project_path).name,
+                        "project_id": _pid,
                     },
                 })
                 try:
@@ -846,12 +1056,20 @@ async def _execute_multi_agent_build(
                             "🚀 Multi-agent auto-run: '%s' mode=%s",
                             run_cmd_used, r.get("mode", "legacy"),
                         )
+                        # Schedule repair watcher — detects post-launch crashes
+                        try:
+                            asyncio.create_task(
+                                _get_re()._repair_loop(_pid, Path(project_path))
+                            )
+                            logger.info("🔧 [FORJADOR] repair watcher scheduled for '%s'", _pid)
+                        except Exception as _rew_exc:
+                            logger.warning("⚠️ Could not schedule repair watcher: %s", _rew_exc)
                 except Exception as _exc:
                     logger.warning("⚠️ Multi-agent auto-run failed: %s", _exc)
     except Exception as exc:
         logger.warning("⚠️ Could not save multi-agent project: %s", exc)
 
-    return _format_multi_agent_result(
+    formatted_result = _format_multi_agent_result(
         project_name=project_name,
         frontend_files=frontend_files_result,
         backend_files=backend_files_result,
@@ -860,6 +1078,9 @@ async def _execute_multi_agent_build(
         run_command=run_cmd_used,
         run_output=run_output,
     )
+    if _multi_validation_prefix:
+        return _multi_validation_prefix + formatted_result
+    return formatted_result
 
 
 async def _process_message_inner(
@@ -1071,6 +1292,10 @@ async def _process_message_inner(
     if response:
         return response
 
+    # ── Intent detection — EARLY, before prefix checks ─────────────────
+    # Must be computed here so prefix guards can use it. Re-used below.
+    intent = MemoryDecisionLayer._detect_intent(user_message.lower().strip())
+
     # ── Detectar comandos directos ──────────────────────────
     if user_lower.startswith("ejecutar "):
         plan_id = user_message[len("ejecutar "):].strip()
@@ -1081,7 +1306,8 @@ async def _process_message_inner(
                 return f"⚠️ Error al ejecutar plan:\n{result['error']}"
             return _format_execution_result(result)
 
-    if user_lower.startswith(("plan ", "build ", "crea ", "construye ")):
+    # Guard: don't treat file/command requests as build_app calls
+    if user_lower.startswith(("plan ", "build ", "crea ", "construye ")) and not intent.startswith(("file_", "command_")):
         for prefix in ("plan ", "build ", "crea ", "construye "):
             if user_lower.startswith(prefix):
                 idea = user_message[len(prefix):].strip()
@@ -1091,6 +1317,8 @@ async def _process_message_inner(
             result = await call_build_app(idea)
             if "error" in result:
                 return f"⚠️ Error al generar plan:\n{result['error']}"
+            if not result.get("plan_id"):
+                return result.get("message", "⚠️ Backend respondió sin plan_id")
             state["state"] = "WAITING_CONFIRMATION"
             state["plan_id"] = result.get("plan_id")
             save_states()
@@ -1134,9 +1362,6 @@ async def _process_message_inner(
         {"role": "user", "content": user_prompt}
     ]
 
-    # ── Intent detection — ONCE, early, before any AI call ──
-    intent = MemoryDecisionLayer._detect_intent(user_message.lower().strip())
-
     # ── El Forjador: approval override ──────────────────────────────
     # Exact-match only: the entire message must be a confirmation token.
     # This prevents questions and new code requests from triggering a build.
@@ -1147,6 +1372,36 @@ async def _process_message_inner(
     ):
         intent = "code_generate"
         logger.info("🏗️ El Forjador: explicit approval → intent overridden to code_generate")
+
+    # ── Bug #5 fix: active app request routing ──────────────────────
+    # If an app is running and the user wants to test/request an endpoint,
+    # route to curl instead of generating new code.
+    _REQUEST_PATTERNS = [
+        "haz request", "make request", "prueba el endpoint",
+        "test endpoint", "prueba endpoint", "request a /", "get /",
+    ]
+    _msg_low = user_message.lower()
+    if (
+        _active_app
+        and intent in ("code_generate", None)
+        and any(p in _msg_low for p in _REQUEST_PATTERNS)
+    ):
+        # Extract endpoint if user mentioned one (e.g. "haz request a /ping")
+        _ep = "/ping"
+        for _part in user_message.split():
+            if _part.startswith("/"):
+                _ep = _part.rstrip(".,;")
+                break
+        intent = "command_run"
+        if "params" not in context:
+            context["params"] = {}
+        context["params"]["command"] = [
+            "curl", f"http://localhost:{_active_app['port']}{_ep}"
+        ]
+        logger.info(
+            "📡 Active-app routing: curl %s on port %s",
+            _ep, _active_app["port"],
+        )
 
     # ═══════════════════════════════════════════════════════════════
     # PRE-AI ACTION GATE
@@ -1188,11 +1443,40 @@ async def _process_message_inner(
 
             if plan_result.get("success"):
                 state["forjador_pending_request"] = user_message
-                state["forjador_state"] = "WAITING_BUILD_APPROVAL"
                 state["approved_blueprint"] = plan_result["result"]["project"]
-                save_states()
-                logger.info("📐 El Forjador: PlannerAgent blueprint ready, waiting for build approval")
-                return _render_blueprint(plan_result["result"]["project"])
+                if _wants_auto_approve(user_message):
+                    # auto_aprobar=true → execute build phase immediately, no human wait.
+                    # IMPORTANT: do NOT "fall through" — the build else-branch is unreachable
+                    # from here; we must run the build logic inline and return.
+                    logger.info("🏗️ [FORJADOR] auto_aprobar=true → building immediately")
+                    state["forjador_state"] = "WAITING_BUILD_APPROVAL"
+                    save_states()
+                    _bp = state.get("approved_blueprint")
+                    if _bp and _bp.get("frontend") and _bp.get("backend"):
+                        _auto_result = await _execute_multi_agent_build(
+                            blueprint=_bp,
+                            original_request=actual_request,
+                            chat_id=chat_id,
+                        )
+                    else:
+                        _auto_result = await _execute_action(
+                            intent="code_generate",
+                            decision_trace=decision_trace,
+                            user_message=actual_request,
+                            chat_id=chat_id,
+                            extra_params={"mode": "build"},
+                        )
+                    state.pop("forjador_pending_request", None)
+                    state.pop("forjador_state", None)
+                    state.pop("approved_blueprint", None)
+                    save_states()
+                    logger.info("✅ [FORJADOR] request handled completely — stopping AI loop")
+                    return _auto_result or "⚠️ El Forjador no pudo construir el proyecto. Intenta de nuevo."
+                else:
+                    state["forjador_state"] = "WAITING_BUILD_APPROVAL"
+                    save_states()
+                    logger.info("📐 El Forjador: PlannerAgent blueprint ready, waiting for build approval")
+                    return _render_blueprint(plan_result["result"]["project"])
 
             # PlannerAgent failed — fall back to CodeAction blueprint path
             logger.warning(
@@ -1210,8 +1494,33 @@ async def _process_message_inner(
                 state["forjador_pending_request"] = user_message
                 state["forjador_state"] = "WAITING_BUILD_APPROVAL"
                 save_states()
-                logger.info("📐 El Forjador: blueprint stored (fallback), waiting for build approval")
-                return action_result
+                if _wants_auto_approve(user_message):
+                    # auto_aprobar=true on fallback path — build inline and return.
+                    logger.info("🏗️ [FORJADOR] auto_aprobar=true → building immediately (fallback path)")
+                    _bp = state.get("approved_blueprint")
+                    if _bp and _bp.get("frontend") and _bp.get("backend"):
+                        _auto_result = await _execute_multi_agent_build(
+                            blueprint=_bp,
+                            original_request=actual_request,
+                            chat_id=chat_id,
+                        )
+                    else:
+                        _auto_result = await _execute_action(
+                            intent="code_generate",
+                            decision_trace=decision_trace,
+                            user_message=actual_request,
+                            chat_id=chat_id,
+                            extra_params={"mode": "build"},
+                        )
+                    state.pop("forjador_pending_request", None)
+                    state.pop("forjador_state", None)
+                    state.pop("approved_blueprint", None)
+                    save_states()
+                    logger.info("✅ [FORJADOR] request handled completely — stopping AI loop")
+                    return _auto_result or "⚠️ El Forjador no pudo construir el proyecto. Intenta de nuevo."
+                else:
+                    logger.info("📐 El Forjador: blueprint stored (fallback), waiting for build approval")
+                    return action_result
 
         # ── Build phase ─────────────────────────────────────────────
         else:
@@ -1246,9 +1555,16 @@ async def _process_message_inner(
                 logger.info("🏗️ El Forjador: build complete, state cleared")
                 return action_result
 
+        # El Forjador ran but produced no result (build failed, CodeAction returned None, etc.).
+        # NEVER fall through to the AI loop — the LLM would improvise with notion_create
+        # or other tools and produce garbage. Return a clean error instead.
         logger.warning(
-            "⚠️ El Forjador: no result for '%s', continuing with AI...",
+            "⚠️ [FORJADOR] No result for intent='%s' — stopping AI loop to prevent improvisation",
             intent,
+        )
+        return (
+            "⚠️ El Forjador no pudo procesar la solicitud. "
+            "Por favor intenta de nuevo con más detalle."
         )
 
     elif _should_execute_action(intent):
@@ -1275,7 +1591,9 @@ async def _process_message_inner(
         logger.info(f"🔄 Iteración {iteration + 1}")
 
         try:
-            response, api_used = await call_ai_with_fallback(messages, tools=NOTION_TOOLS)
+            # Elegir tools según intent: archivos → FILESYSTEM_TOOLS, resto → NOTION_TOOLS
+            _ai_tools = FILESYSTEM_TOOLS if intent and intent.startswith("file_") else NOTION_TOOLS
+            response, api_used = await call_ai_with_fallback(messages, tools=_ai_tools)
             content = response["content"]
             raw = response["raw"]
             assistant_message = raw.choices[0].message
@@ -1358,8 +1676,47 @@ async def _process_message_inner(
                 function_args = json.loads(tool_call.function.arguments)
                 logger.info(f"🔧 Ejecutando: {function_name} con {function_args}")
 
+                # ── file_create — acción filesystem via ActionSystem ──────
+                if function_name == "file_create":
+                    logger.info("⚡ Tool call 'file_create' routed through ActionSystem")
+                    _fc_trace = {
+                        "intent": "file_write",
+                        "changed": False,
+                        "source": "tool_call",
+                        "confidence": 1.0,
+                    }
+                    decision_trace_container.append(_fc_trace)
+                    _fc_context = {
+                        "user_id": str(chat_id),
+                        "params": {
+                            "name": function_args.get("name", "output.txt"),
+                            "content": function_args.get("content", ""),
+                            "request": user_message,
+                        },
+                        "decision_trace": _fc_trace,
+                        "user_message": user_message,
+                    }
+                    _fc_action = ActionRouter.route(_fc_trace, "file_write", _fc_context)
+                    if _fc_action is not None:
+                        _fc_start = time.time()
+                        try:
+                            _fc_result = await _fc_action.execute()
+                            result = _fc_result.get("result", _fc_result)
+                        except Exception as _e:
+                            result = {"error": str(_e)}
+                        ActionLogger.log(
+                            user_id=str(chat_id),
+                            action_type=_fc_action.action_type,
+                            params=function_args,
+                            result=result if isinstance(result, dict) else {"result": result},
+                            approved=None,
+                            duration_ms=int((time.time() - _fc_start) * 1000),
+                        )
+                    else:
+                        result = {"error": "Failed to route file_create through ActionSystem"}
+
                 # ── Tool de LECTURA (información, no acciones) ──
-                if function_name == "notion_search":
+                elif function_name == "notion_search":
                     result = await notion_search(function_args["query"])
 
                 elif function_name == "notion_fetch":
@@ -1415,17 +1772,17 @@ async def _process_message_inner(
 
                 elif function_name == "build_app":
                     # Blocked: code intents are fully handled by El Forjador pre-AI.
-                    # If the AI somehow reaches this point with a code intent, it is a bug.
+                    # If the AI reaches this point it means El Forjador did not short-circuit
+                    # properly. Return immediately — do NOT let the AI loop continue and
+                    # improvise with other tools (notion_create, etc.).
                     logger.warning(
-                        "🚫 build_app tool_call blocked — code intents must be handled "
-                        "by El Forjador (pre-AI gate), not by the AI tool loop"
+                        "🚫 [FORJADOR] build_app tool_call blocked — stopping AI loop immediately"
                     )
-                    result = {
-                        "error": (
-                            "build_app is not available inside the AI loop. "
-                            "Code generation is handled exclusively by the Action System."
-                        )
-                    }
+                    return (
+                        "⚠️ El Forjador detectó un intento de generación de código dentro "
+                        "del loop conversacional. Esto es un bug de orquestación. "
+                        "Por favor repite tu solicitud."
+                    )
 
                 elif function_name == "execute_plan":
                     result = await call_execute_plan(function_args["plan_id"])

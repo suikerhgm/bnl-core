@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>una app web con ping y time</title>
+</head>
+<body>
+  <h1>una app web con ping y time</h1>
+  <button onclick="pingBackend()">Ping backend</button>
+  <p id="result"></p>
+  <script>
+    async function pingBackend() {
+      try {
+        const res = await fetch("/ping");
+        const data = await res.json();
+        document.getElementById("result").textContent = data.message;
+      } catch (e) {
+        document.getElementById("result").textContent = "Error: " + e;
+      }
+    }
+  
+  (function checkStatus() {
+    fetch('/ping')
+      .then(function(r) {
+        var el = document.getElementById('status');
+        if (!el) return;
+        if (r.ok) { el.textContent = 'OK'; el.style.color = 'green'; }
+        else      { el.textContent = 'ERROR ' + r.status; el.style.color = 'red'; }
+      })
+      .catch(function() {
+        var el = document.getElementById('status');
+        if (el) { el.textContent = 'ERROR'; el.style.color = 'red'; }
+      });
+  })();
+
+  window.addEventListener('unhandledrejection', function(e) {
+    var msg = e.reason && (e.reason.message || String(e.reason)) || 'Unknown error';
+    var el = document.getElementById('status');
+    if (el) { el.textContent = 'Error: ' + msg; el.style.color = 'red'; }
+    console.error('Unhandled rejection:', e.reason);
+  });
+
+  function fetchTime() {
+    fetch('/time')
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        var el = document.getElementById('time-result');
+        if (el) el.textContent = data.time || JSON.stringify(data);
+      })
+      .catch(function(e) {
+        var el = document.getElementById('time-result');
+        if (el) el.textContent = 'Error: ' + e.message;
+      });
+  }
+</script>
+
+  <p id="status" style="color:grey;font-size:0.85em">Checking...</p>
+
+  <button id="time-btn" onclick="fetchTime()">Get Time</button>
+  <p id="time-result"></p>
+</body>
+</html>

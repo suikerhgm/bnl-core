@@ -46,10 +46,10 @@ class UnifiedIsolationRuntime:
     def _build_driver_list(self) -> list[IsolationDriver]:
         """Build driver list in tier order. Missing deps degrade gracefully."""
         drivers: list[IsolationDriver] = []
-        # Tier 1-2: VM drivers (Plan B — not yet built)
+        # Tier 1: Firecracker
         try:
-            from core.vm_isolation.vm_manager import get_vm_manager
-            drivers.append(get_vm_manager())
+            from core.vm_isolation.firecracker_runtime import FirecrackerRuntime
+            drivers.append(FirecrackerRuntime())
         except ImportError:
             pass
         # Tier 3: Docker hardened

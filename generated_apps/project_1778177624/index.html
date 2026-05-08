@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Monitor App</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Monitor App</h1>
+        <div class="buttons">
+            <ping-button></ping-button>
+            <time-button></time-button>
+            <status-button></status-button>
+        </div>
+        <div class="results">
+            <p id="ping-result"></p>
+            <p id="time-result"></p>
+            <p id="status-result"></p>
+        </div>
+    </div>
+    <script src="components/PingButton.js"></script>
+    <script src="components/TimeButton.js"></script>
+    <script src="components/StatusButton.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>

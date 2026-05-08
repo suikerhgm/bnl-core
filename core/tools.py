@@ -4,6 +4,34 @@ Definiciones de herramientas para function calling de la IA.
 from typing import List, Dict
 
 
+FILESYSTEM_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "file_create",
+            "description": (
+                "Crea un archivo local en el servidor con el nombre y contenido dados. "
+                "Usa esta herramienta cuando el usuario pide crear, escribir o guardar un archivo local. "
+                "NO uses notion_create para archivos locales."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Nombre del archivo, ej: 'test.txt', 'notas.md'"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Contenido del archivo"
+                    }
+                },
+                "required": ["name", "content"]
+            }
+        }
+    }
+]
+
 NOTION_TOOLS = [
     {
         "type": "function",

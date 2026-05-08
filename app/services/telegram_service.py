@@ -15,6 +15,7 @@ from enum import Enum
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 
+from core.approval_system import ApprovalSystem
 from core.state_manager import (
     get_chat_state,
     save_states,
@@ -22,6 +23,7 @@ from core.state_manager import (
     save_short_memory,
     clean_memory
 )
+
 from core.ai_cascade import (
     call_ai_with_fallback,
     NEXUS_BNL_SYSTEM_PROMPT,
@@ -147,6 +149,57 @@ async def handle_telegram_update(update: dict) -> None:
 
     logger.info(f"💬 Mensaje de {chat_id}: {user_message}")
 
+    # ── Detectar comandos de aprobación ──────────────────────
+    if user_message.startswith("/aprobar ") or user_message.startswith("/rechazar "):
+        await _handle_approval_command(chat_id, user_message)
+        return
+    # ──────────────────────────────────────────────────────────
+
     state = get_chat_state(chat_id)
     response_text = await process_message(user_message, chat_id, state)
     await send_telegram_message(chat_id, response_text)
+
+
+# ===== MANEJO DE APROBACIONES =====
+
+async def _handle_approval_command(chat_id: int, message: str) -> None:
+    """
+    Maneja comandos de aprobación (/aprobar, /rechazar).
+
+    Args:
+        chat_id: Chat ID de Telegram
+        message: Mensaje del usuario (ej: "/aprobar abc12345")
+    """
+    parts = message.split()
+    if len(parts) != 2:
+        await send_telegram_message(
+            chat_id,
+            "❌ Formato incorrecto. Usa:\n"
+            "`/aprobar <id>` para ejecutar\n"
+            "`/rechazar <id>` para cancelar"
+        )
+        return
+
+    command = parts[0]
+    approval_id = parts[1]
+
+    approved = (command == "/aprobar")
+    success = ApprovalSystem.resolve_approval(approval_id, approved)
+
+    if success:
+        emoji = "✅" if approved else "❌"
+        action = "aprobada" if approved else "rechazada"
+        await send_telegram_message(
+            chat_id,
+            f"{emoji} Accion {action} correctamente."
+        )
+        logger.info(f"✅ Approval command processed: {approval_id} -> {action}")
+    else:
+        await send_telegram_message(
+            chat_id,
+            "⚠️ No se encontro la aprobacion con ese ID.\n"
+            "(Pudo haber expirado o ya fue resuelta)"
+        )
+        logger.warning(f"⚠️ Approval ID not found: {approval_id}")
+
+

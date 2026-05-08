@@ -3,7 +3,16 @@
     "allow": [
       "Bash(python -c \"import secrets; print\\(secrets.token_hex\\(32\\)\\)\")",
       "PowerShell(python -c \"import secrets; print\\(secrets.token_hex\\(32\\)\\)\")",
-      "PowerShell(py -3 -c \"import secrets; print\\(secrets.token_hex\\(32\\)\\)\")"
+      "PowerShell(py -3 -c \"import secrets; print\\(secrets.token_hex\\(32\\)\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(python _test_render.py)",
+      "Bash(python -c \"import core.execution_engine; from core.execution_engine import ExecutionEngine; import inspect; e = ExecutionEngine\\(\\); print\\('OK'\\); print\\('run is coroutine:', inspect.iscoroutinefunction\\(e.run\\)\\)\")",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(venvScriptspython.exe -c ' *)",
+      "PowerShell(& \"venv\\\\Scripts\\\\python.exe\" -m uvicorn --version 2>&1)",
+      "Bash(venv/Scripts/python.exe -c ' *)",
+      "PowerShell(& \"venv\\\\Scripts\\\\python.exe\" run.py --help)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app/dashboard.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")"
     ]
   }
 }

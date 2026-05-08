@@ -1,0 +1,6 @@
+{
+  "index.html": "frontend",
+  "script.js": "frontend",
+  "backend/main.py": "backend",
+  "backend/routes/ping.py": "backend"
+}

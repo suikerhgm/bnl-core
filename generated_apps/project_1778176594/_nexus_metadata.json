@@ -1,0 +1,11 @@
+{
+  "index.html": "frontend",
+  "estilos.css": "frontend",
+  "script.js": "frontend",
+  "botones.html": "frontend",
+  "navegacion.html": "frontend",
+  "backend/app.py": "backend",
+  "backend/ping.py": "backend",
+  "backend/time.py": "backend",
+  "backend/status.py": "backend"
+}

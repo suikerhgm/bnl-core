@@ -1,0 +1,10 @@
+{
+  "index.html": "frontend",
+  "estilos.css": "frontend",
+  "script.js": "frontend",
+  "backend/app.py": "backend",
+  "backend/utils.py": "backend",
+  "backend/models.py": "backend",
+  "backend/routes.py": "backend",
+  "backend/config.py": "backend"
+}

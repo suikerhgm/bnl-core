@@ -109,7 +109,216 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
             previous_accuracy_json TEXT,
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS action_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            action_type TEXT NOT NULL,
+            params_json TEXT NOT NULL,
+            result_json TEXT,
+            approved INTEGER,
+            executed_at TEXT NOT NULL,
+            duration_ms INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS process_state (
+            project_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            port TEXT,
+            command_json TEXT,
+            cwd TEXT,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS process_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            port TEXT,
+            command_json TEXT,
+            logs_json TEXT,
+            finished_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_process_history_project
+            ON process_history(project_id);
+
+        CREATE INDEX IF NOT EXISTS idx_process_history_finished
+            ON process_history(finished_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_process_history_project_finished
+            ON process_history(project_id, finished_at DESC);
     """)
+
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Process runtime persistence
+# ═══════════════════════════════════════════════════════════════════
+
+_MAX_PROCESS_HISTORY     = 100    # read cap: how many rows load_process_history() returns
+_MAX_PROCESS_HISTORY_DB  = 1000   # physical cap: rows kept in the table after each write
+
+
+def _cleanup_process_history(conn: sqlite3.Connection) -> None:
+    """Delete rows older than the Nth most recent entry. Never raises.
+
+    The cutoff is computed once inside a derived table (materialised scalar),
+    so the ORDER BY + LIMIT index scan runs exactly once regardless of how many
+    rows the outer DELETE touches. When the table has fewer than
+    _MAX_PROCESS_HISTORY_DB rows the derived table returns no rows, the scalar
+    is NULL, and the WHERE clause matches nothing — no rows deleted.
+    """
+    try:
+        conn.execute(
+            """
+            DELETE FROM process_history
+            WHERE finished_at IS NOT NULL
+              AND finished_at < (
+                  SELECT cutoff FROM (
+                      SELECT finished_at AS cutoff
+                      FROM process_history
+                      ORDER BY finished_at DESC
+                      LIMIT 1 OFFSET ?
+                  )
+              )
+            """,
+            (_MAX_PROCESS_HISTORY_DB,),
+        )
+    except Exception as exc:
+        logger.warning("_cleanup_process_history failed: %s", exc)
+
+
+def vacuum_db() -> None:
+    """Rebuild the database file to reclaim free pages and defragment storage.
+
+    MUST be called manually (admin / debug use only). Never invoke during
+    normal runtime — VACUUM acquires an exclusive lock for its entire duration
+    and cannot run inside an open transaction.
+    """
+    try:
+        with _db_lock:
+            conn = _get_connection()
+            conn.execute("VACUUM")
+        logger.info("🧹 vacuum_db: complete")
+    except Exception as exc:
+        logger.warning("vacuum_db failed: %s", exc)
+
+
+def _validate_command(command: Any) -> list:
+    """Return a safe command list; coerce invalid values to [] with a warning."""
+    if isinstance(command, list) and all(isinstance(x, str) for x in command):
+        return command
+    logger.warning("Invalid command format %r — coercing to []", command)
+    return []
+
+
+def save_process_state(
+    project_id: str,
+    status: str,
+    port: Optional[str],
+    command: Any,
+    cwd: str,
+) -> None:
+    """Upsert the current state of a project process. Fail-safe."""
+    try:
+        safe_command = _validate_command(command)
+        with _db_lock:
+            conn = _get_connection()
+            conn.execute(
+                """
+                INSERT INTO process_state (project_id, status, port, command_json, cwd, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    status       = excluded.status,
+                    port         = excluded.port,
+                    command_json = excluded.command_json,
+                    cwd          = excluded.cwd,
+                    updated_at   = excluded.updated_at
+                """,
+                (project_id, status, port, json.dumps(safe_command), cwd, _utc_now()),
+            )
+            conn.commit()
+    except Exception as exc:
+        logger.warning("save_process_state failed for '%s': %s", project_id, exc)
+
+
+def save_process_history_entry(record: Dict[str, Any]) -> None:
+    """Append a completed execution to process_history. Fail-safe."""
+    try:
+        safe_command = _validate_command(record.get("command", []))
+        with _db_lock:
+            conn = _get_connection()
+            conn.execute(
+                """
+                INSERT INTO process_history
+                    (project_id, status, port, command_json, logs_json, finished_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record["project_id"],
+                    record["status"],
+                    record.get("port"),
+                    json.dumps(safe_command),
+                    json.dumps(record.get("logs", []), default=str),
+                    record.get("finished_at", _utc_now()),
+                ),
+            )
+            _cleanup_process_history(conn)   # trim table BEFORE commit
+            conn.commit()
+    except Exception as exc:
+        logger.warning("save_process_history_entry failed: %s", exc)
+
+
+def load_process_states() -> list:
+    """Load all persisted process state rows. Returns [] on failure."""
+    try:
+        with _db_lock:
+            conn = _get_connection()
+            rows = conn.execute(
+                "SELECT project_id, status, port, command_json, cwd FROM process_state"
+            ).fetchall()
+        result = []
+        for r in rows:
+            cmd = _safe_json_deserialize(r["command_json"])
+            result.append({
+                "project_id": r["project_id"],
+                "status":     r["status"],
+                "port":       r["port"],
+                "command":    cmd if isinstance(cmd, list) else [],
+                "cwd":        r["cwd"] or "",
+            })
+        return result
+    except Exception as exc:
+        logger.warning("load_process_states failed: %s", exc)
+        return []
+
+
+def load_process_history() -> list:
+    """Load process history entries ordered newest-first. Returns [] on failure."""
+    try:
+        with _db_lock:
+            conn = _get_connection()
+            rows = conn.execute(
+                "SELECT project_id, status, port, command_json, logs_json, finished_at "
+                "FROM process_history ORDER BY finished_at DESC LIMIT ?",
+                (_MAX_PROCESS_HISTORY,),
+            ).fetchall()
+        result = []
+        for r in rows:
+            raw_cmd = _safe_json_deserialize(r["command_json"])
+            result.append({
+                "project_id":  r["project_id"],
+                "status":      r["status"],
+                "port":        r["port"],
+                "command":     _validate_command(raw_cmd),   # coerce corrupt rows to []
+                "logs":        _safe_json_deserialize(r["logs_json"]) or [],
+                "finished_at": r["finished_at"],
+            })
+        return result
+    except Exception as exc:
+        logger.warning("load_process_history failed: %s", exc)
+        return []
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -478,3 +687,144 @@ def _deep_copy_perf(perf: Dict[str, Any]) -> Dict[str, Any]:
         src: {"correct": data["correct"], "total": data["total"]}
         for src, data in perf.items()
     }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Action history persistence
+# ═══════════════════════════════════════════════════════════════════
+
+def save_action_log(
+    user_id: str,
+    action_type: str,
+    params: dict,
+    result: dict,
+    approved: Optional[bool],
+    duration_ms: int,
+) -> None:
+    """
+    Guarda registro de acción ejecutada en SQLite.
+
+    Args:
+        user_id: ID del usuario que disparó la acción
+        action_type: Tipo de acción (NotionAction, FileAction, etc.)
+        params: Parámetros de la acción
+        result: Resultado de la ejecución
+        approved: True (aprobada), False (rechazada), None (autónoma)
+        duration_ms: Tiempo de ejecución en milisegundos
+
+    This function never raises. Failures are logged and silently dropped.
+    """
+    user_id = _validate_user_id(user_id)
+
+    if not isinstance(action_type, str):
+        logger.warning("save_action_log: action_type is not a string, skipping")
+        return
+
+    params_json = _safe_json_serialize(params)
+    result_json = _safe_json_serialize(result)
+    executed_at = _utc_now()
+
+    # Normalizar approved: None → None, bool → int
+    approved_int: Optional[int] = None
+    if approved is True:
+        approved_int = 1
+    elif approved is False:
+        approved_int = 0
+
+    if not isinstance(duration_ms, int):
+        duration_ms = 0
+
+    try:
+        with _db_lock:
+            conn = _get_connection()
+            conn.execute(
+                """INSERT INTO action_history
+                   (user_id, action_type, params_json, result_json,
+                    approved, executed_at, duration_ms)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    user_id,
+                    action_type,
+                    params_json,
+                    result_json,
+                    approved_int,
+                    executed_at,
+                    duration_ms,
+                ),
+            )
+            conn.commit()
+        logger.debug("Action log saved for user '%s': %s", user_id, action_type)
+    except sqlite3.Error as e:
+        logger.error("SQLite error in save_action_log: %s", e, exc_info=True)
+    except Exception as e:
+        logger.error("Unexpected error in save_action_log: %s", e, exc_info=True)
+
+
+def get_action_history(user_id: str, limit: int = 10) -> list:
+    """
+    Recupera historial de acciones del usuario.
+
+    Args:
+        user_id: ID del usuario
+        limit: Número máximo de registros a retornar
+
+    Returns:
+        Lista de diccionarios con historial de acciones.
+        Cada dict contiene: id, user_id, action_type, params, result,
+        approved, executed_at, duration_ms, success.
+        Retorna lista vacía si no hay registros o hay error.
+    """
+    user_id = _validate_user_id(user_id)
+
+    if not isinstance(limit, int) or limit < 1:
+        limit = 10
+
+    try:
+        with _db_lock:
+            conn = _get_connection()
+            cursor = conn.execute(
+                """SELECT id, user_id, action_type, params_json, result_json,
+                          approved, executed_at, duration_ms
+                   FROM action_history
+                   WHERE user_id = ?
+                   ORDER BY id DESC
+                   LIMIT ?""",
+                (user_id, limit),
+            )
+            rows = cursor.fetchall()
+
+        history = []
+        for row in rows:
+            params = _safe_json_deserialize(row["params_json"])
+            result = _safe_json_deserialize(row["result_json"])
+
+            if not isinstance(params, dict):
+                params = {}
+            if not isinstance(result, dict):
+                result = {}
+
+            success = result.get("success", False) if isinstance(result, dict) else False
+
+            entry = {
+                "id": row["id"],
+                "user_id": row["user_id"],
+                "action_type": row["action_type"],
+                "params": params,
+                "result": result,
+                "success": success,
+                "approved": row["approved"],
+                "executed_at": row["executed_at"],
+                "duration_ms": row["duration_ms"],
+            }
+            history.append(entry)
+
+        return history
+
+    except sqlite3.Error as e:
+        logger.error("SQLite error in get_action_history: %s", e, exc_info=True)
+        return []
+    except Exception as e:
+        logger.error("Unexpected error in get_action_history: %s", e, exc_info=True)
+        return []
+
+

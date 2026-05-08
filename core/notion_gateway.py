@@ -238,6 +238,69 @@ async def notion_create(database_id: str, properties: Dict, children: Optional[L
         return {"error": f"Error inesperado al crear página en Notion: {str(e)}"}
 
 
+async def notion_create_child_page(parent_id: str, title: str, content: str = "") -> Dict:
+    """
+    Crea una nueva página como hija de una página existente (no database).
+    
+    Args:
+        parent_id: ID de la página padre
+        title: Título de la nueva página
+        content: Contenido markdown (opcional)
+    
+    Returns:
+        Dict con la respuesta de la API de Notion
+    """
+    if not parent_id or not parent_id.strip():
+        return {"error": "El ID de la página padre está vacío."}
+    if not title or not title.strip():
+        return {"error": "El título está vacío."}
+
+    cleaned_id = _clean_page_id(parent_id)
+    if cleaned_id != parent_id:
+        parent_id = cleaned_id
+
+    url = "https://api.notion.com/v1/pages"
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json"
+    }
+    
+    properties = {
+        "title": {
+            "title": [{"text": {"content": title}}]
+        }
+    }
+    
+    data = {
+        "parent": {"page_id": parent_id},
+        "properties": properties
+    }
+    
+    # Construir bloques de contenido si hay contenido
+    if content:
+        data["children"] = build_notion_blocks(title, content, "")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, json=data, timeout=30.0)
+            if response.status_code == 200:
+                result = response.json()
+                logger.info(f"✅ Página hija creada en Notion: {title} bajo {parent_id}")
+                return result
+            error_detail = response.json().get("message", "Error desconocido")
+            logger.error(f"❌ Notion create child page error ({response.status_code}): {error_detail}")
+            if response.status_code == 400:
+                return {"error": f"Error al crear la página hija: {error_detail}."}
+            return {"error": f"Notion respondió con error ({response.status_code}): {error_detail}"}
+    except httpx.RequestError as e:
+        logger.error(f"❌ Error de conexión con Notion create child page: {e}")
+        return {"error": f"No se pudo conectar con Notion: {str(e)}"}
+    except Exception as e:
+        logger.error(f"❌ Error inesperado en notion_create_child_page: {e}", exc_info=True)
+        return {"error": f"Error inesperado al crear página hija en Notion: {str(e)}"}
+
+
 async def notion_update(page_id: str, properties: Dict) -> Dict:
     """Actualiza las propiedades de una página existente en Notion."""
     if not page_id or not page_id.strip():

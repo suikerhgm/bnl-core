@@ -1,0 +1,13 @@
+{
+  "index.html": "frontend",
+  "styles.css": "frontend",
+  "script.js": "frontend",
+  "components/Button.js": "frontend",
+  "components/Status.js": "frontend",
+  "components/Time.js": "frontend",
+  "server.py": "backend",
+  "api/ping.py": "backend",
+  "api/time.py": "backend",
+  "api/status.py": "backend",
+  "utils/utils.py": "backend"
+}

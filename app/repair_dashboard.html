@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ERROR_TAXONOMY_SYSTEM — Repair Dashboard</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --border: #2a2d3a;
+      --accent: #6366f1;
+      --green: #22c55e;
+      --red: #ef4444;
+      --yellow: #eab308;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; padding: 24px; }
+    h1 { font-size: 1.5rem; margin-bottom: 4px; color: #a5b4fc; }
+    .subtitle { color: var(--muted); font-size: 0.875rem; margin-bottom: 24px; }
+    .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 28px; }
+    .metric-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+    .metric-label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 6px; }
+    .metric-value { font-size: 2rem; font-weight: 700; }
+    .metric-value.green { color: var(--green); }
+    .metric-value.red   { color: var(--red); }
+    .metric-value.accent{ color: var(--accent); }
+    .section-title { font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: #c7d2fe; }
+    .active-repairs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 28px; min-height: 36px; }
+    .badge { background: #312e81; color: #a5b4fc; border-radius: 6px; padding: 4px 12px; font-size: 0.8rem; }
+    .badge.empty { color: var(--muted); background: none; border: 1px solid var(--border); }
+    table { width: 100%; border-collapse: collapse; background: var(--surface); border-radius: 10px; overflow: hidden; }
+    th { background: #12141f; color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: .05em; padding: 10px 14px; text-align: left; }
+    td { padding: 10px 14px; border-top: 1px solid var(--border); font-size: 0.85rem; vertical-align: top; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    tr:hover td { background: rgba(99,102,241,.06); }
+    .cat { display: inline-block; border-radius: 4px; padding: 2px 8px; font-size: 0.75rem; font-weight: 600; }
+    .cat.dependency_error { background:#1d4ed8; color:#bfdbfe; }
+    .cat.import_error     { background:#7c3aed; color:#ede9fe; }
+    .cat.syntax_error     { background:#b45309; color:#fef3c7; }
+    .cat.port_error       { background:#be123c; color:#ffe4e6; }
+    .cat.runtime_error    { background:#0f766e; color:#ccfbf1; }
+    .cat.unknown_error    { background:#374151; color:#d1d5db; }
+    .ok  { color: var(--green); }
+    .fail{ color: var(--red);   }
+    .ts  { color: var(--muted); font-size: 0.75rem; }
+    #refresh-btn { background: var(--accent); color: white; border: none; border-radius: 6px; padding: 8px 18px; cursor: pointer; font-size: 0.85rem; margin-bottom: 20px; }
+    #refresh-btn:hover { background: #4f46e5; }
+    #last-updated { color: var(--muted); font-size: 0.75rem; margin-left: 12px; }
+  </style>
+</head>
+<body>
+  <h1>ERROR_TAXONOMY_SYSTEM</h1>
+  <p class="subtitle">Repair Dashboard — detect → classify → fix → relaunch → monitor</p>
+
+  <button id="refresh-btn" onclick="load()">↻ Refresh</button>
+  <span id="last-updated"></span>
+
+  <div class="metrics" id="metrics"></div>
+
+  <div class="section-title">Active Repairs</div>
+  <div class="active-repairs" id="active-repairs"></div>
+
+  <div class="section-title">Repair History (last 30)</div>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Project</th>
+        <th>Attempt</th>
+        <th>Category</th>
+        <th>Fix Applied</th>
+        <th>Status</th>
+        <th>Timestamp</th>
+      </tr>
+    </thead>
+    <tbody id="history-body"></tbody>
+  </table>
+
+  <script>
+    function fmtTs(ts) {
+      if (!ts) return '-';
+      const d = new Date(ts * 1000);
+      return d.toLocaleString('es-ES', { hour12: false });
+    }
+
+    function catBadge(cat) {
+      return `<span class="cat ${cat}">${cat}</span>`;
+    }
+
+    async function load() {
+      try {
+        const r = await fetch('/repair/status');
+        const data = await r.json();
+
+        // Metrics
+        const m = data.metrics || {};
+        document.getElementById('metrics').innerHTML = `
+          <div class="metric-card">
+            <div class="metric-label">Total Attempts</div>
+            <div class="metric-value accent">${m.repair_attempts ?? 0}</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Success Rate</div>
+            <div class="metric-value green">${m.repair_success_rate ?? 0}%</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Successes</div>
+            <div class="metric-value green">${m.repair_successes ?? 0}</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Failures</div>
+            <div class="metric-value red">${m.repair_failures ?? 0}</div>
+          </div>
+        `;
+
+        // Active repairs
+        const active = data.active_repairs || [];
+        const ar = document.getElementById('active-repairs');
+        if (active.length === 0) {
+          ar.innerHTML = '<span class="badge empty">No active repairs</span>';
+        } else {
+          ar.innerHTML = active.map(id => `<span class="badge">⚙ ${id}</span>`).join('');
+        }
+
+        // History
+        const rows = data.history || [];
+        const tbody = document.getElementById('history-body');
+        if (rows.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted);text-align:center">No repair history yet</td></tr>';
+        } else {
+          tbody.innerHTML = rows.map(r => `
+            <tr>
+              <td class="ts">${r.id}</td>
+              <td title="${r.project_id}">${r.project_id.slice(-16)}</td>
+              <td>${r.attempt}</td>
+              <td>${catBadge(r.error_category)}</td>
+              <td title="${r.fix_applied}">${(r.fix_applied||'-').slice(0,40)}</td>
+              <td class="${r.success ? 'ok' : 'fail'}">${r.success ? '✓ OK' : '✗ failed'}</td>
+              <td class="ts">${fmtTs(r.timestamp)}</td>
+            </tr>
+          `).join('');
+        }
+
+        document.getElementById('last-updated').textContent =
+          'Updated: ' + new Date().toLocaleTimeString('es-ES', { hour12: false });
+      } catch (e) {
+        console.error('Repair dashboard load error:', e);
+      }
+    }
+
+    load();
+    setInterval(load, 10000);  // auto-refresh every 10s
+  </script>
+</body>
+</html>

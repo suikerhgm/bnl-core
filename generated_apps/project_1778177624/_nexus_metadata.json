@@ -1,0 +1,14 @@
+{
+  "index.html": "frontend",
+  "styles.css": "frontend",
+  "script.js": "frontend",
+  "components/PingButton.js": "frontend",
+  "components/TimeButton.js": "frontend",
+  "components/StatusButton.js": "frontend",
+  "backend/server.py": "backend",
+  "backend/routes.py": "backend",
+  "backend/models.py": "backend",
+  "backend/utils.py": "backend",
+  "backend/config.py": "backend",
+  "backend/database.py": "backend"
+}
