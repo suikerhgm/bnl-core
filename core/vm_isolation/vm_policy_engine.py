@@ -100,7 +100,9 @@ class VMPolicyEngine:
     ) -> Tuple[bool, Optional[str]]:
         """Returns (valid, rejection_reason). reason is None if valid."""
         policy = PROFILE_POLICIES[profile]
-        runtime_type = _TIER_RUNTIME_TYPE[tier]
+        runtime_type = _TIER_RUNTIME_TYPE.get(tier)
+        if runtime_type is None:
+            return False, f"unknown tier: {tier!r}"
 
         if runtime_type in policy.forbidden_runtime_types:
             return False, f"runtime type '{runtime_type}' is forbidden for {profile.value}"

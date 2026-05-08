@@ -101,8 +101,18 @@ class HypervisorGuardian:
         while self._running:
             try:
                 self._poll_once()
-            except Exception:
-                pass
+            except Exception as e:
+                try:
+                    self._logger.log_event(
+                        vm_id="system",
+                        event_type="GUARDIAN_ERROR",
+                        severity="ERROR",
+                        description=f"Monitor loop error: {type(e).__name__}: {e}",
+                        metadata={"error_type": type(e).__name__},
+                        origin_component="hypervisor_guardian",
+                    )
+                except Exception:
+                    pass  # logger itself failed — truly silent fallback
             time.sleep(self._poll_interval)
 
     def _poll_once(self) -> None:
