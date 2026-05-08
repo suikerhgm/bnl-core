@@ -18,6 +18,12 @@ from core.architect.models import (
 )
 
 _TASK_TYPE_KEYWORDS: dict[str, list[str]] = {
+    # app_create checked first — highest priority for MVP phase
+    "app_create":      ["crea una app", "crear app", "crea una aplicación", "nueva app",
+                        "make an app", "create an app", "create a app", "build an app",
+                        "create a simple app", "create a basic app", "create a todo app",
+                        "create a notes app", "make a simple app",
+                        "app de ", "aplicación de ", "una app", " a simple app", " an app"],
     "security_scan":   ["security", "vulnerability", "scan", "audit", "threat", "exploit"],
     "frontend_ui":     ["ui", "frontend", "component", "interface", "dashboard", "css", "html"],
     "api_design":      ["api", "endpoint", "rest", "graphql", "route", "swagger"],

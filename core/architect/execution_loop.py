@@ -113,8 +113,10 @@ class ArchitectExecutionLoop:
     ) -> FinalResponse:
         """
         Full pipeline: request → Architect → plan → dispatch → validate → [repair] → result.
+        For app_create tasks: routes directly to AppCreator for real file generation.
         """
         from core.architect.models import ArchitectExecutionContext
+        from core.architect.agent_task_planner import AgentTaskPlanner
 
         loop_start = int(time.monotonic() * 1000)
         trace: list[ExecutionTraceStep] = []
@@ -130,7 +132,19 @@ class ArchitectExecutionLoop:
             detail=f"execution_id={ctx.execution_id[:8]}… user={user_id}",
         ))
 
-        # ── Step 2: Execute through Architect ────────────────────────────────
+        # ── Step 1b: Classify request — detect app_create early ──────────────
+        planner = AgentTaskPlanner()
+        classification = planner._classify(user_request)
+
+        if classification["task_type"] == "app_create":
+            return await self._run_app_creation(
+                user_request=user_request,
+                ctx=ctx,
+                trace=trace,
+                loop_start=loop_start,
+            )
+
+        # ── Step 2: Execute through Architect (non-app tasks) ────────────────
         t0 = int(time.monotonic() * 1000)
         try:
             result = await self._core.receive_request(user_request, ctx=ctx)
@@ -236,6 +250,92 @@ class ArchitectExecutionLoop:
             error_summary=result.error_summary,
             fallback_chain=result.fallback_chain,
             audit_refs=result.audit_refs,
+        )
+
+    async def _run_app_creation(
+        self,
+        user_request: str,
+        ctx,
+        trace: list,
+        loop_start: int,
+    ) -> FinalResponse:
+        """Direct path for app_create tasks — uses AppCreator for real file generation."""
+        from core.architect.app_creator import AppCreator
+
+        trace.append(ExecutionTraceStep(
+            step="app_create_detected",
+            status="ok",
+            detail="routing to AppCreator for real file generation",
+        ))
+
+        t0 = int(time.monotonic() * 1000)
+        creator = AppCreator()
+        try:
+            app_result = await creator.create(user_request)
+        except Exception as e:
+            trace.append(ExecutionTraceStep(
+                step="app_create", status="fail",
+                detail=f"AppCreator exception: {type(e).__name__}: {e}",
+            ))
+            return self._build_error_response(ctx, str(e), trace, loop_start)
+
+        create_ms = int(time.monotonic() * 1000) - t0
+        status = "ok" if app_result.success else "fail"
+        trace.append(ExecutionTraceStep(
+            step="app_create",
+            status=status,
+            detail=(
+                f"app={app_result.app_name} "
+                f"files={len(app_result.files_created)} "
+                f"pid={app_result.pid} port={app_result.port}"
+            ),
+            duration_ms=create_ms,
+        ))
+
+        # Validate the created app
+        is_valid = app_result.success and len(app_result.files_created) > 0
+        trace.append(ExecutionTraceStep(
+            step="validate",
+            status="ok" if is_valid else "warn",
+            detail=app_result.execution_output or (app_result.error or "no output"),
+        ))
+
+        total_ms = int(time.monotonic() * 1000) - loop_start
+        trace.append(ExecutionTraceStep(
+            step="finalize",
+            status="ok" if is_valid else "warn",
+            detail=f"total_ms={total_ms}",
+        ))
+
+        # Build human-readable message
+        if app_result.success:
+            msg_parts = [f"App '{app_result.app_name}' created"]
+            msg_parts.append(f"({len(app_result.files_created)} files)")
+            if app_result.pid:
+                msg_parts.append(f"running pid={app_result.pid}")
+            if app_result.port:
+                msg_parts.append(f"port={app_result.port}")
+            msg_parts.append(f"path={app_result.app_path}")
+            msg = " • ".join(msg_parts)
+        else:
+            msg = f"App creation failed: {app_result.error}"
+
+        return FinalResponse(
+            success=app_result.success,
+            message=msg,
+            execution_id=ctx.execution_id,
+            plan_id=f"app-{app_result.app_name}",
+            task_count=1,
+            agents_used=["AppCreator"],
+            runtimes_used=["AppCreator"],
+            avg_security_score=0,
+            execution_time_ms=total_ms,
+            repair_attempted=False,
+            repair_succeeded=False,
+            trace=trace,
+            outputs=app_result.files_created,
+            error_summary=app_result.error,
+            audit_refs=[ctx.execution_id],
         )
 
     def _build_error_response(self, ctx, error_msg, trace, loop_start) -> FinalResponse:

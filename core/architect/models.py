@@ -105,6 +105,7 @@ class OrchestrationResult:
 # ── Deterministic lookup tables ───────────────────────────────────────────────
 
 CAPABILITY_MAP: dict[str, list[str]] = {
+    "app_create":      ["code_generation", "api_design"],
     "code_generate":   ["code_generation"],
     "security_scan":   ["security_analysis", "threat_modeling"],
     "api_design":      ["api_design", "code_generation"],
@@ -117,6 +118,7 @@ CAPABILITY_MAP: dict[str, list[str]] = {
 }
 
 DEPARTMENT_MAP: dict[str, str] = {
+    "app_create":      "engineering",
     "code_generate":   "engineering",
     "security_scan":   "security",
     "api_design":      "engineering",
@@ -150,6 +152,7 @@ RISK_TO_MIN_SECURITY_SCORE: dict[str, int] = {
 }
 
 TASK_TYPE_TO_PERMISSION: dict[str, str] = {
+    "app_create":      "FS_WRITE",
     "code_generate":   "FS_WRITE",
     "security_scan":   "SB_SCAN",
     "api_design":      "FS_WRITE",
